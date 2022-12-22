@@ -479,6 +479,148 @@ def fit_lines(wavelengths, flux, fluxerr, lines, diagnostic_plots=True):
     return linestable
 
 
+def queryNIST(linestable, wavelengths, flux, fluxerr):
+    '''
+    Query NIST for atomic lines near best-fit line locations.
+    Inputs:
+    linestable [pandas DF]: table of successfully fitted lines
+    wavelengths [arr]: 
+    flux [arr]: 
+    fluxerr [arr]: 
+    
+    Returns:
+    ???
+    '''    
+    
+    for i in range(len(linestable)):
+
+        line = linestable.loc[i, :] ## Line is current row in linestable
+
+        ## Set window around peak based on best-fit mean and stddev values
+
+        margin = 3. * float(line['Stddev']) # AA
+        peak = float(line['Measured peak'])
+        ulim = peak - margin
+        hlim = peak + margin
+        print(ulim, hlim, peak, margin)
+
+        trim = (wavelengths >= ulim) & (wavelengths <= hlim)
+        x = wavelengths[trim]
+        y = flux[trim]
+        yerr = fluxerr[trim]
+        print('Wavelength range: ', x.min(), x.max())
+
+
+        #################################
+        ## Query NIST for nearby lines ##
+        #################################
+
+        NISTresults = pd.DataFrame(columns=['Spectrum', 'Observed', 'Rel.', 'Acc.'])
+        elements = ['H', 'He', 'C', 'N', 'O', 'Na', 'Mg', 'Si', 'S', 'Cl', 'Ca', 'Fe']
+        found_el = []
+
+        for i, el in enumerate(elements):
+
+            try:
+                result = Nist.query(ulim * u.AA, hlim * u.AA, linename=f"{el}")
+            except:
+                continue
+
+            ## Count number of elements with matching lines
+            found_el.append(i)
+
+            ## Save line information
+
+            try:    spec = result['Spectrum'].data
+            except: spec = np.array([f'{el} I']*len(result))  # If NIST result has no Spectrum column, then only one ionization level exists
+
+            newresult = pd.DataFrame( data={'Spectrum':spec, 
+                                            'Observed':result['Observed'].data, 
+                                            'Rel.':result['Rel.'].data.astype(str), 
+                                            'Acc.':result['Acc.'].data} )
+
+            newresult.dropna(axis=0, subset=['Observed', 'Rel.'], inplace=True)
+            NISTresults = pd.concat([NISTresults, newresult], axis=0, ignore_index=True)
+
+
+        ## Reformat relative intensities column (strip keyword info)
+        
+        NISTresults['Rel.'] = NISTresults['Rel.'].str.replace('[,()\*a-zA-Z?:]', '', regex=True).str.strip()
+        NISTresults['Rel.'] = NISTresults['Rel.'].str.replace('', '0', regex=True).str.strip()
+        NISTresults['Rel.'] = NISTresults['Rel.'].astype(float)
+
+        
+        ## Save table
+        
+        if not os.path.exists(f'{analysispath}/{swpid}_{objname}/lineID_tables'):
+            os.mkdir(f'{analysispath}/{swpid}_{objname}/lineID_tables')
+
+        NISTresults.to_csv(f'{analysispath}/{swpid}_{objname}/lineID_tables/{round(peak)}.csv', index=False)
+
+
+        #######################
+        ## Visualize results ##
+        #######################
+
+        plt.figure()
+
+        ## From list of indices, which elements had matching lines?
+        
+        ID_elements = [elements[i] for i in found_el]
+
+        
+        ## Set colormap, opacities for plotting
+        
+        cmap = mpl.colormaps['Spectral'] # gist_rainbow is clearer but uglier
+        colors = cmap(np.linspace(0,1,len(ID_elements)))
+        maxint = NISTresults['Rel.'].max()
+
+        for i, el in enumerate(ID_elements):
+
+            ## Isolate lines attributed to l, plot each one
+            el_lines = NISTresults.loc[NISTresults['Spectrum'].str.contains(f'{el} ')]
+
+            if i%2==0: ls = '--'
+            else: ls = '-.'
+
+            for j, l in el_lines.iterrows():
+                plt.vlines(l['Observed'], y.min(), y.max(), 
+                           alpha=(float(l['Rel.'])/maxint)**.1, ls=ls, lw=2, color=colors[i])
+
+        ## Save legend handles
+        
+        handles = []
+
+        for i in range(0, len(ID_elements)):
+
+            if i%2==0: ls = '--'
+            else: ls = '-.'
+
+            handles = np.append( handles, Line2D([0],[0],color=colors[i], lw=3, ls=ls, label=f'{ID_elements[i]}') )
+
+
+        ## Finish formatting plot
+        
+        plt.plot( x, y, c='k' )
+        plt.fill_between( x, y-yerr, y+yerr, alpha=0.5, color='gray' )
+        plt.legend(handles, ID_elements)
+        plt.grid(True)
+        plt.xlabel(r'Wavelength ($\AA$)', fontsize=14)
+        plt.ylabel(r'Flux (erg/cm$^2$/s/$\AA$)', fontsize=14)
+
+        
+        ## Save figure
+        
+        if not os.path.exists(f'{analysispath}/{swpid}_{objname}/lineID_plots'):
+            os.mkdir(f'{analysispath}/{swpid}_{objname}/lineID_plots')
+
+        plt.savefig(f'{analysispath}/{swpid}_{objname}/lineID_plots/{round(peak)}.png')
+        plt.close()
+        
+        return 0
+
+
+
 
 if __name__ == "__main__":
     
@@ -509,7 +651,18 @@ if __name__ == "__main__":
         ## Clean up spectrum (apply redshift correction, subtract blackbody continuum)
         row = table[i]
         wavelengths, flux, fluxerr, spclass, snr, Teff = clean_spectrum(row)
-
+        
+        
+        ## Identify peaks in spectrum
+        lines = find_lines(wavelengths, flux, fluxerr, diagnostic_plots=True)
+        
+        
+        ## Fit Gaussian profile to peaks -- if successful, probably a spectral line
+        linestable = fit_lines(wavelengths, flux, fluxerr, lines, diagnostic_plots=True)
+        
+        
+        ## Query NIST for atomic lines near each identified spectral line
+        queryNIST(linestable, wavelengths, flux, fluxerr)
     
     
     return 0
