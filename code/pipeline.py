@@ -19,8 +19,9 @@ import astropy.constants as const
 import astropy.coordinates as coord
 from astropy.table import Table, vstack, hstack, join
 from astropy.modeling import models
+from astropy.modeling.fitting import LevMarLSQFitter
 from specutils.fitting import find_lines_threshold, find_lines_derivative, fit_lines
-from specutils.manipulation import noise_region_uncertainty
+from specutils.manipulation import noise_region_uncertainty, trapezoid_smooth
 from specutils import Spectrum1D, SpectralRegion
 from astropy.nddata import NDUncertainty
 from scipy.optimize import curve_fit
@@ -31,10 +32,16 @@ from astroquery.xmatch import XMatch
 from astroquery.vizier import Vizier
 from astroquery.mast import Observations
 
+## Suppress warnings (for astropy fitting)
+warnings.filterwarnings('ignore', category=UserWarning, append=True)
 
 ## Where should analysis results and data be saved to?
-global analysispath = '/Users/isabelkain/Desktop/GALEX/analysis'
-global datapath = '/Users/isabelkain/Desktop/GALEX/data'
+analysispath = '/Users/isabelkain/Desktop/GALEX/analysis'
+datapath = '/Users/isabelkain/Desktop/GALEX/data'
+
+## Helper functions
+angstrom2meter = 10**-10
+joules2ergs = 10**7
 
 
 def redshift_correction(wavelengths_observed, z):
@@ -63,12 +70,12 @@ def blackbody(wavelengths, Teff):
     B [arr]: blackbody continuum for Teff (unitless)
     '''
     
-    wav = wavelengths * aangstrom2meter * u.m
+    wav = wavelengths * angstrom2meter * u.m
     Teff = Teff * u.K
     
     B = (2. * const.h * const.c**2) / (wav**5.) / ( np.exp( (const.h * const.c) / (wav * const.k_B * Teff) ) - 1. )
     
-    return B / B.max()
+    return (B / B.max()).value
 
 
 def fitBB_fixedTeff(wavelengths, Teff, a, b):
@@ -94,12 +101,25 @@ def fitBB_fitTeff(wavelengths, Teff, a, b):
     -- [arr]: blackbody continuum curve
     '''
     
-    wav = wavelengths * aangstrom2meter * u.m
+    wav = wavelengths * angstrom2meter * u.m
     Teff = Teff * u.K
     
     B = (2. * const.h * const.c**2) / (wav**5.) / ( np.exp( (const.h * const.c) / (wav * const.k_B * Teff) ) - 1. )
 
-    return a * (B / B.max()) + b
+    return a * (B / B.max()).value + b
+
+
+def MAD(array):
+    '''
+    Return the median absolute deviation (MAD) of array
+    Input:
+    array [arr]: 1xn array of values
+    
+    Returns:
+    -- [scalar]: MAD
+    '''
+    med = np.median(array)
+    return np.median([abs(num - med) for num in array])
 
 
 def clean_spectrum(table):
@@ -133,11 +153,11 @@ def clean_spectrum(table):
     snr = hdul[1].header['DER_SNR']         # Derived signal-to-noise ratio  
     
     ## Record redshift & temperature
-    z = table['redshift'].value[0]
-    Teff = table['Fe_H_Teff'].value[0]
-
-    if Teff == 0: 
-        Teff = 5000.01 # guess value of 5000.01 K if no Teff available
+    z = table['redshift']
+    Teff = table['Fe_H_Teff']
+    
+    if type(z) == np.ma.core.MaskedConstant: z = 0. # if z masked, assume 0 FIXME
+    if Teff == 0: Teff = 5000.01 # guess value of 5000.01 K if no Teff available
 
     ## Read in wavelength, flux, and fluxerr data
 
@@ -178,6 +198,7 @@ def clean_spectrum(table):
 
     ## Plot masked spectrum and scaled blackbody curve, save as diagnostic
 
+    plt.figure()
     plt.plot(x, y, label='Spectrum')
 
     if Teff == 5000.01:
@@ -201,6 +222,7 @@ def clean_spectrum(table):
     
     ## Plot BB-subtracted flux
 
+    plt.figure()
     plt.plot( wavelengths, flux, color='k', label='Blackbody-subtracted' )
     plt.fill_between(wavelengths, flux + fluxerr, flux - fluxerr, alpha=0.5, color='gray')
 
@@ -260,7 +282,6 @@ def find_lines(wavelengths, flux, fluxerr, diagnostic_plots=True):
     ## Plot identified lines
 
     plt.figure(figsize=(12,4))
-
     plt.plot( wavelengths, flux, c='k')
     plt.fill_between(wavelengths, flux + fluxerr, flux - fluxerr, alpha=0.5, color='gray')
     plt.hlines( thresh, wavelengths.min(), wavelengths.max(), ls='--' )
@@ -282,15 +303,15 @@ def find_lines(wavelengths, flux, fluxerr, diagnostic_plots=True):
         os.mkdir(f'{analysispath}/{swpid}_{objname}/linefit_plots')
 
     plt.savefig(f'{analysispath}/{swpid}_{objname}/linefit_plots/found_peaks.png')
+    plt.close()
     
-    
-    return lines
+    return lines, thresh
 
 
 
 
 
-def fit_lines(wavelengths, flux, fluxerr, lines, diagnostic_plots=True):
+def fit_speclines(wavelengths, flux, fluxerr, lines, thresh, diagnostic_plots=True):
     '''
     Fit Gaussian profile to peaks in stellar spectrum to determine which are true lines.
     Inputs:
@@ -312,7 +333,7 @@ def fit_lines(wavelengths, flux, fluxerr, lines, diagnostic_plots=True):
 
     ## Make copy of spectrum to mask lines as we fit them
 
-    search_spectrum = Spectrum1D(flux=raw_spectrum.flux, spectral_axis=raw_spectrum.spectral_axis) # use unsmoothed, smoothing shifts peak locations enough to be troublesome
+    search_spectrum = Spectrum1D(flux=flux*(u.erg/u.cm**2/u.s/u.AA), spectral_axis=wavelengths*u.AA) # use unsmoothed, smoothing shifts peak locations enough to be troublesome
     search_spectrum.mask = [False]*len(search_spectrum.data)
     
     
@@ -379,7 +400,6 @@ def fit_lines(wavelengths, flux, fluxerr, lines, diagnostic_plots=True):
             oldmask = search_spectrum.mask
 
             search_spectrum.mask = np.logical_or(hideline, oldmask)
-            print('Mask check: ', np.sum(hideline), np.sum(np.logical_or(hideline, oldmask)), np.sum(search_spectrum.mask) )
 
 
             ## Save peak wavelength
@@ -420,13 +440,11 @@ def fit_lines(wavelengths, flux, fluxerr, lines, diagnostic_plots=True):
             # Plot full spectrum with line annotated
             ax2.plot( wavelengths, flux, c='k' )
             ax2.fill_between( wavelengths, flux + fluxerr, flux - fluxerr, alpha=0.5, color='gray' )
-            ax2.hlines( thresh, wavelengths.min(), wavelengths.max(), ls='--' )
 
             ax2.set_ylim(0.2*flux.min(), 30*np.median(np.abs(flux)))
             ymin, ymax = ax2.set_ylim()
 
-            ax2.vlines(g_fit.mean.value, ymin, ymax, alpha=0.6, color='cornflowerblue', label='Flux threshold')
-            ax2.legend()
+            ax2.vlines(g_fit.mean.value, ymin, ymax, alpha=0.6, color='cornflowerblue')
             ax2.set_xlabel(r'Wavelength ($\AA$)', fontsize=14)
 
 
@@ -502,13 +520,11 @@ def queryNIST(linestable, wavelengths, flux, fluxerr):
         peak = float(line['Measured peak'])
         ulim = peak - margin
         hlim = peak + margin
-        print(ulim, hlim, peak, margin)
 
         trim = (wavelengths >= ulim) & (wavelengths <= hlim)
         x = wavelengths[trim]
         y = flux[trim]
         yerr = fluxerr[trim]
-        print('Wavelength range: ', x.min(), x.max())
 
 
         #################################
@@ -630,7 +646,9 @@ if __name__ == "__main__":
 
     
     ## Process each IUE spectrum
-    for i, swpid in enumerate(table['obs_id']):
+    for i, swpid in enumerate(tqdm(table['obs_id'])):
+        
+#         print(f'{i+1}/{len(table)}, {swpid}')
 
         ## Grab and reformat object name
         objname = table[i]['main_id'].replace(' ','')
@@ -654,15 +672,16 @@ if __name__ == "__main__":
         
         
         ## Identify peaks in spectrum
-        lines = find_lines(wavelengths, flux, fluxerr, diagnostic_plots=True)
+        lines, thresh = find_lines(wavelengths, flux, fluxerr, diagnostic_plots=True)
         
         
         ## Fit Gaussian profile to peaks -- if successful, probably a spectral line
-        linestable = fit_lines(wavelengths, flux, fluxerr, lines, diagnostic_plots=True)
+        linestable = fit_speclines(wavelengths, flux, fluxerr, lines, thresh, diagnostic_plots=True)
         
         
         ## Query NIST for atomic lines near each identified spectral line
         queryNIST(linestable, wavelengths, flux, fluxerr)
+        
+
+    print(f'Reduction of {i+1} spectra complete.')
     
-    
-    return 0
