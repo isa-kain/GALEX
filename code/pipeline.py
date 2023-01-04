@@ -1,3 +1,6 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -7,6 +10,10 @@ import warnings
 from tqdm import tqdm
 import glob
 from urllib import request
+import shutil
+from tempfile import mkstemp
+import time
+from multiprocessing import Pool
 
 import matplotlib as mpl
 from matplotlib.colors import ListedColormap, LinearSegmentedColormap
@@ -32,12 +39,19 @@ from astroquery.xmatch import XMatch
 from astroquery.vizier import Vizier
 from astroquery.mast import Observations
 
+# ## Line identification by user, not by fitting line profiles?
+# user = True
+
 ## Suppress warnings (for astropy fitting)
 warnings.filterwarnings('ignore', category=UserWarning, append=True)
 
 ## Where should analysis results and data be saved to?
 analysispath = '/Users/isabelkain/Desktop/GALEX/analysis'
-datapath = '/Users/isabelkain/Desktop/GALEX/data'
+datapath = '/Volumes/Seagate/seagate_backup/GALEX/data'
+codepath = '/Users/isabelkain/Desktop/GALEX/code'
+
+scriptname = 'bokehplot.py'
+scriptpath = f'{codepath}/{scriptname}'
 
 ## Helper functions
 angstrom2meter = 10**-10
@@ -157,7 +171,17 @@ def clean_spectrum(table):
     Teff = table['Fe_H_Teff']
     
     if type(z) == np.ma.core.MaskedConstant: z = 0. # if z masked, assume 0 FIXME
-    if Teff == 0: Teff = 5000.01 # guess value of 5000.01 K if no Teff available
+        
+#     if Teff == 0: 
+#         fit_teff = True
+#         Teff = 5000. # guess value of 5000 K if no Teff available
+#     else:
+#         fit_teff = False
+
+    ## Always fit Teff for best-fitting blackbody
+    if Teff == 0: Teff = 5000. # guess value of 5000 K if no Teff available
+    fit_teff = True
+    
 
     ## Read in wavelength, flux, and fluxerr data
 
@@ -174,20 +198,22 @@ def clean_spectrum(table):
     
     ## Mask most features to let curve_fit see the underlying emission
 
-    med = np.median(rawflux)
-    std = np.std(rawflux)
-    mask = np.logical_and((rawflux <= med + .5*std), (rawflux >= med - .5*std)) 
-    
+    diff = rawflux[1:] - rawflux[:-1]
+    diff = np.append(diff, 0.)
+    std = np.std(diff)
+    mask = np.logical_and((diff <= 2*std), (diff >= -2*std))
+
     x = wavelengths[mask]
     y = rawflux[mask]
     yerr = fluxerr[mask]
 
+
     ## Fit blackbody curve. If Teff known, then fix for curve_fit, else let vary
     
-    if Teff == 5000.01:
+    if fit_teff:
         popt, pcov = curve_fit(fitBB_fitTeff, x, y, p0=[Teff, 0., 0.],
                                sigma=yerr, absolute_sigma=True,
-                               bounds=((4000., 0, 0), (9000., y.max(), np.inf))) 
+                               bounds=((3000., 0, 0), (9000., y.max(), np.inf))) 
         
         Teff = popt[0]
 
@@ -201,9 +227,9 @@ def clean_spectrum(table):
     plt.figure()
     plt.plot(x, y, label='Spectrum')
 
-    if Teff == 5000.01:
-        plt.plot(wavelengths, fitBB_fitTeff(wavelengths, popt[0], popt[1], popt[2]), 
-                 label=f'Blackbody fit:\n{popt[1]:0.2e}func + {popt[2]:0.2e}\nTeff = {popt[0]}')
+    if fit_teff:
+        plt.plot(wavelengths, fitBB_fitTeff(wavelengths, Teff, popt[1], popt[2]), 
+                 label=f'Blackbody fit:\n{popt[1]:0.2e}func + {popt[2]:0.2e}\nTeff = {Teff}')
     else:
         plt.plot(wavelengths, fitBB_fixedTeff(wavelengths, Teff, popt[0], popt[1]), 
                  label=f'Blackbody fit:\n{popt[0]:0.2e}func + {popt[1]:0.2e}\nTeff = {Teff}')
@@ -212,12 +238,16 @@ def clean_spectrum(table):
     plt.legend()
 
     plt.savefig(f'{analysispath}/{swpid}_{objname}/{swpid}_blackbody.png', bbox_inches='tight')
-    plt.close()
+    plt.close('all')
     
     
     ## Subtract BB curve
 
-    flux = rawflux - fitBB_fixedTeff(wavelengths, Teff, popt[0], popt[1])
+    if fit_teff:
+        flux = rawflux - fitBB_fitTeff(wavelengths, Teff, popt[1], popt[2])
+    else:
+        flux = rawflux - fitBB_fixedTeff(wavelengths, Teff, popt[0], popt[1])
+
 
     
     ## Plot BB-subtracted flux
@@ -233,7 +263,7 @@ def clean_spectrum(table):
     plt.title(f'{dispersion}-DISP {camera}, {spclass}, SNR {snr}')
 
     plt.savefig(f'{analysispath}/{swpid}_{objname}/{swpid}.png', bbox_inches='tight')
-    plt.close()
+    plt.close('all')
     
     
     ## Save cleaned spectrum
@@ -245,7 +275,7 @@ def clean_spectrum(table):
     return wavelengths, flux, fluxerr, spclass, snr, Teff
 
 
-def find_lines(wavelengths, flux, fluxerr, diagnostic_plots=True):
+def find_peaks(wavelengths, flux, fluxerr, swpid, objname, diagnostic_plots=True):
     '''
     Identify peaks in stellar spectrum.
     Inputs:
@@ -303,15 +333,81 @@ def find_lines(wavelengths, flux, fluxerr, diagnostic_plots=True):
         os.mkdir(f'{analysispath}/{swpid}_{objname}/linefit_plots')
 
     plt.savefig(f'{analysispath}/{swpid}_{objname}/linefit_plots/found_peaks.png')
-    plt.close()
+    plt.close('all')
+    
+    
+    ## Format and save table of found peaks
+    
+    savelines = lines[lines['line_type']=='emission']
+    savelines['Peak label'] = np.round(savelines['line_center'].value).astype(int).astype(str)
+    savelines['Spectrum'] = np.full(len(savelines), '?')
+    savelines['Confident?'] = np.full(len(savelines), False)
+
+    savelines.write(f'{datapath}/{swpid}_foundpeaks.ecsv', overwrite=True)
+
     
     return lines, thresh
 
 
 
+def user_peaks(wavelengths, flux, fluxerr):
+    '''
+    Since lines are hard to fit because of intrinsic shape and low SNR, 
+    ask user to identify lines by eye in reduced spectrum.
+    Inputs:
+    wavelengths [arr]: 
+    flux [arr]: 
+    fluxerr [arr]: 
+    
+    Returns:
+    linestable [pd DataFrame]: table of peaks found by specutils + user
+
+    '''
+    
+    ## Change swpid, objname, starname in bokeh script
+    replace_swpid(scriptpath, swpid, objname)
+    
+    ## Call script to host bokeh server. OS will pause here until user closes the Bokeh server
+    os.system(f'bokeh serve --show {scriptname}')
+
+    ###########################
+    ## Plot results          ##
+    ###########################
+        
+    linestable = pd.read_csv(f'{analysispath}/{swpid}_{objname}/linestable.csv') ## if bokeh fails, file DNE
+    linestable = linestable[linestable['Measured peak'] != 0.] # try again to remove all null lines
+    linestable.reset_index(inplace=True)
+    
+    linestable.to_csv(f'{analysispath}/{swpid}_{objname}/linestable.csv', index=False)
+
+    
+    ## Make plot of full spectrum with line positions annotated
+    
+    plt.figure(figsize=(12,4))
+    plt.plot(wavelengths, flux, color='k', zorder=5)
+    plt.fill_between(wavelengths, flux-fluxerr, flux+fluxerr, alpha=0.5, color='gray', zorder=5)
+
+    plt.ylim(0.5*flux.min(), 50*np.median(np.abs(flux)))
+    ymin, ymax = plt.ylim()
+
+    for i in range(len(linestable)):
+        plt.vlines(linestable.loc[i, 'Measured peak'], ymin, ymax, color='#B488D3', lw=2, ls='--')
+
+    ## Save full spectrum figure
+    
+    if not os.path.exists(f'{analysispath}/{swpid}_{objname}/linefit_plots'):
+        os.mkdir(f'{analysispath}/{swpid}_{objname}/linefit_plots')
+
+    plt.savefig(f'{analysispath}/{swpid}_{objname}/linefit_plots/all_lines.png')
+    plt.close('all')
+    
+    return linestable
 
 
-def fit_speclines(wavelengths, flux, fluxerr, lines, thresh, diagnostic_plots=True):
+
+
+
+def fit_peaks(wavelengths, flux, fluxerr, lines, thresh, diagnostic_plots=True):
     '''
     Fit Gaussian profile to peaks in stellar spectrum to determine which are true lines.
     Inputs:
@@ -453,7 +549,7 @@ def fit_speclines(wavelengths, flux, fluxerr, lines, thresh, diagnostic_plots=Tr
                 os.mkdir(f'{analysispath}/{swpid}_{objname}/linefit_plots')
 
             plt.savefig(f'{analysispath}/{swpid}_{objname}/linefit_plots/{i}_{round(cen)}_{status}.png')
-            plt.close()
+            plt.close('all')
 
 
     ## Record successfully fit lines
@@ -481,23 +577,78 @@ def fit_speclines(wavelengths, flux, fluxerr, lines, thresh, diagnostic_plots=Tr
         os.mkdir(f'{analysispath}/{swpid}_{objname}/linefit_plots')
 
     plt.savefig(f'{analysispath}/{swpid}_{objname}/linefit_plots/all_lines.png')
-    plt.close()
+    plt.close('all')
 
-    ## Save table of found lines
+#     ## Save table of found lines as Pandas DataFrame
     
-    columns=['NIST peak', 'Measured peak', 'Stddev', 'Peak label', 'Spectrum', 'Confident?']
-    rows = np.array([goodlines['line_center'], goodlines['peak_fit'], goodlines['peak_std'], 
-                     np.round(goodlines['line_center'].value).astype(int),np.full(len(goodlines), '?'), 
-                     np.zeros(len(goodlines))]).T
+#     columns=['Approx peak', 'Measured peak', 'Stddev', 'Peak label', 'Spectrum', 'Confident?']
+#     rows = np.array([goodlines['line_center'], goodlines['peak_fit'], goodlines['peak_std'], 
+#                      np.round(goodlines['line_center'].value).astype(int),np.full(len(goodlines), '?'), 
+#                      np.zeros(len(goodlines))]).T
 
-    linestable = pd.DataFrame(columns=columns, data=rows)
-    linestable.to_csv(f'{analysispath}/{swpid}_{objname}/linestable.csv', index=False)
+#     linestable = pd.DataFrame(columns=columns, data=rows)
+#     linestable.to_csv(f'{analysispath}/{swpid}_{objname}/linestable.csv', index=False)
+
+    linestable = write_linestable(goodlines)
 
     
     return linestable
 
 
-def queryNIST(linestable, wavelengths, flux, fluxerr):
+
+
+def write_linestable(lines, swpid, objname):
+    '''
+    Save table of found lines as Pandas DataFrame
+    '''
+    
+    try:
+        peak_fit = lines['peak_fit']
+    except:
+        peak_fit = np.zeros(len(lines))
+        
+    try:
+        peak_std = lines['peak_std']
+    except:
+        peak_std = np.zeros(len(lines))
+    
+    
+    columns=['Approx peak', 'Measured peak', 'Stddev', 'Peak label', 'Spectrum', 'Confident?']
+    rows = np.array([lines['line_center'], peak_fit, peak_std, 
+                     np.round(lines['line_center'].value).astype(int),np.full(len(lines), '?'), 
+                     np.zeros(len(lines))]).T
+
+    linestable = pd.DataFrame(columns=columns, data=rows)
+    linestable.to_csv(f'{analysispath}/{swpid}_{objname}/linestable.csv', index=False)
+    
+    return linestable
+
+
+
+def filter_peaks(lines, swpid, objname):
+    '''
+    Filter peaks found in find_peaks only by if they're emission lines longer than 1200 A.
+    Inputs:
+    - lines [QTable]: lines found by specutils.find_lines_derivative()
+    Returns:
+    - linestable [pd DF]: table of lines
+    '''
+    
+    ## Throw out absorption lines
+    lines = lines[lines['line_type']=='emission']
+    
+    ## Throw out if <1200 Angstroms
+    lines = lines[lines['line_center'].value >= 1200.]
+    
+    ## Reformat to Pandas and save
+    linestable = write_linestable(lines, swpid, objname)
+    
+    return linestable
+
+
+
+
+def queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname):
     '''
     Query NIST for atomic lines near best-fit line locations.
     Inputs:
@@ -505,21 +656,28 @@ def queryNIST(linestable, wavelengths, flux, fluxerr):
     wavelengths [arr]: 
     flux [arr]: 
     fluxerr [arr]: 
-    
-    Returns:
-    ???
     '''    
     
     for i in range(len(linestable)):
-
+        
         line = linestable.loc[i, :] ## Line is current row in linestable
 
         ## Set window around peak based on best-fit mean and stddev values
+        
+#         if line['Stddev']==0:
+#             margin = 10.
+#         else:
+#             margin = 3. * float(line['Stddev']) # AA
 
-        margin = 3. * float(line['Stddev']) # AA
+        margin = 12.
         peak = float(line['Measured peak'])
+ 
+        if peak==0:
+            peak = float(line['Approx peak'])
+
         ulim = peak - margin
         hlim = peak + margin
+        
 
         trim = (wavelengths >= ulim) & (wavelengths <= hlim)
         x = wavelengths[trim]
@@ -536,7 +694,7 @@ def queryNIST(linestable, wavelengths, flux, fluxerr):
         found_el = []
 
         for i, el in enumerate(elements):
-
+            
             try:
                 result = Nist.query(ulim * u.AA, hlim * u.AA, linename=f"{el}")
             except:
@@ -548,8 +706,9 @@ def queryNIST(linestable, wavelengths, flux, fluxerr):
             ## Save line information
 
             try:    spec = result['Spectrum'].data
-            except: spec = np.array([f'{el} I']*len(result))  # If NIST result has no Spectrum column, then only one ionization level exists
+            except: spec = np.array([f'{el} I']*len(result))  # If result has no Spectrum column, only 1 ionization level exists
 
+                                
             newresult = pd.DataFrame( data={'Spectrum':spec, 
                                             'Observed':result['Observed'].data, 
                                             'Rel.':result['Rel.'].data.astype(str), 
@@ -557,14 +716,14 @@ def queryNIST(linestable, wavelengths, flux, fluxerr):
 
             newresult.dropna(axis=0, subset=['Observed', 'Rel.'], inplace=True)
             NISTresults = pd.concat([NISTresults, newresult], axis=0, ignore_index=True)
-
+            
 
         ## Reformat relative intensities column (strip keyword info)
         
-        NISTresults['Rel.'] = NISTresults['Rel.'].str.replace('[,()\*a-zA-Z?:]', '', regex=True).str.strip()
+        NISTresults['Rel.'] = NISTresults['Rel.'].str.replace('[,()\/*a-zA-Z?:]', '', regex=True).str.strip()
         NISTresults['Rel.'] = NISTresults['Rel.'].str.replace('', '0', regex=True).str.strip()
         NISTresults['Rel.'] = NISTresults['Rel.'].astype(float)
-
+        
         
         ## Save table
         
@@ -577,7 +736,7 @@ def queryNIST(linestable, wavelengths, flux, fluxerr):
         #######################
         ## Visualize results ##
         #######################
-
+        
         plt.figure()
 
         ## From list of indices, which elements had matching lines?
@@ -631,57 +790,67 @@ def queryNIST(linestable, wavelengths, flux, fluxerr):
             os.mkdir(f'{analysispath}/{swpid}_{objname}/lineID_plots')
 
         plt.savefig(f'{analysispath}/{swpid}_{objname}/lineID_plots/{round(peak)}.png')
-        plt.close()
+        plt.close('all')
         
-        return 0
+    
+    return 0
+
+
+def process(row, analysispath, datapath):
+    '''Actually run pipeline.'''
+    
+    ## Grab and reformat object name
+    swpid = row['obs_id']
+    starname = row['main_id']
+    objname = starname.replace(' ','')
+    subfolder = f'{swpid}_{objname}' # e.g. swp55292_HD2454
+
+    ## If analysis subfolder does not exist, create .../analysis/{swpid}_{objname}
+    if not os.path.exists(f'{analysispath}/{subfolder}'):
+        os.mkdir(f'{analysispath}/{subfolder}')
+
+    ## Download data to ../data/subfolder
+    if len(glob.glob(f'{datapath}/{swpid}.fits')) == 0:
+        URL = row['dataURL']
+        response = request.urlretrieve(URL, f'{datapath}/{swpid}.fits')
+
+        
+    ## Clean up spectrum (apply redshift correction, subtract blackbody continuum)
+    wavelengths, flux, fluxerr, spclass, snr, Teff = clean_spectrum(row)
+    
+
+    ## Identify peaks in spectrum
+    lines, thresh = find_peaks(wavelengths, flux, fluxerr, swpid, objname, diagnostic_plots=True)
+
+    
+    ## Fitting process is shitty, do basic filter and let user approve
+    linestable = filter_peaks(lines, swpid, objname)
+
+
+    ## Query NIST for atomic lines near each identified spectral line
+    queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname)
+    
+    
+    return 0
 
 
 
 
 if __name__ == "__main__":
     
-    
+        
     ## Read in table of IUE data
-    table = Table.read(f'{datapath}/dataset.ecsv')
-
+    table = Table.read(f'{analysispath}/dataset.ecsv')
     
-    ## Process each IUE spectrum
-    for i, swpid in enumerate(tqdm(table['obs_id'])):
-        
-#         print(f'{i+1}/{len(table)}, {swpid}')
+    ## Multiprocessing
+    args = [(table[i], analysispath, datapath) for i in range(len(table))]
+    
+    s = time.time()
+    
+    with Pool() as pool:
+        pool.starmap(process, args)
 
-        ## Grab and reformat object name
-        objname = table[i]['main_id'].replace(' ','')
-        subfolder = f'{swpid}_{objname}' # e.g. swp55292_HD2454
+    e = time.time()  
 
-
-        ## If analysis subfolder does not exist, create .../analysis/{swpid}_{objname}
-        if not os.path.exists(f'{analysispath}/{subfolder}'):
-            os.mkdir(f'{analysispath}/{subfolder}')
-
-
-        ## Download data to ../data/subfolder
-        if len(glob.glob(f'{datapath}/{swpid}.fits')) == 0:
-            URL = table[i]['dataURL']
-            response = request.urlretrieve(URL, f'{datapath}/{swpid}.fits')
-            
-            
-        ## Clean up spectrum (apply redshift correction, subtract blackbody continuum)
-        row = table[i]
-        wavelengths, flux, fluxerr, spclass, snr, Teff = clean_spectrum(row)
-        
-        
-        ## Identify peaks in spectrum
-        lines, thresh = find_lines(wavelengths, flux, fluxerr, diagnostic_plots=True)
-        
-        
-        ## Fit Gaussian profile to peaks -- if successful, probably a spectral line
-        linestable = fit_speclines(wavelengths, flux, fluxerr, lines, thresh, diagnostic_plots=True)
-        
-        
-        ## Query NIST for atomic lines near each identified spectral line
-        queryNIST(linestable, wavelengths, flux, fluxerr)
-        
-
-    print(f'Reduction of {i+1} spectra complete.')
+    print(f'Reduction of {len(table)} spectra completed in {(e-s) / 60.} minutes.')
     
