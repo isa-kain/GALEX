@@ -14,6 +14,7 @@ import shutil
 from tempfile import mkstemp
 import time
 from multiprocessing import Pool
+import istarmap
 
 import matplotlib as mpl
 from matplotlib.colors import ListedColormap, LinearSegmentedColormap
@@ -579,16 +580,9 @@ def fit_peaks(wavelengths, flux, fluxerr, lines, thresh, diagnostic_plots=True):
     plt.savefig(f'{analysispath}/{swpid}_{objname}/linefit_plots/all_lines.png')
     plt.close('all')
 
-#     ## Save table of found lines as Pandas DataFrame
     
-#     columns=['Approx peak', 'Measured peak', 'Stddev', 'Peak label', 'Spectrum', 'Confident?']
-#     rows = np.array([goodlines['line_center'], goodlines['peak_fit'], goodlines['peak_std'], 
-#                      np.round(goodlines['line_center'].value).astype(int),np.full(len(goodlines), '?'), 
-#                      np.zeros(len(goodlines))]).T
-
-#     linestable = pd.DataFrame(columns=columns, data=rows)
-#     linestable.to_csv(f'{analysispath}/{swpid}_{objname}/linestable.csv', index=False)
-
+    ## Save table of found lines as Pandas DataFrame
+    
     linestable = write_linestable(goodlines)
 
     
@@ -737,7 +731,12 @@ def queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname):
         ## Visualize results ##
         #######################
         
-        plt.figure()
+        fig = plt.figure()
+        gs = fig.add_gridspec(2, 1,  height_ratios=(3, 1))
+
+        ax1 = fig.add_subplot(gs[0]) # peak + NIST
+        ax2 = fig.add_subplot(gs[1]) # full spectrum with line annotated
+
 
         ## From list of indices, which elements had matching lines?
         
@@ -759,8 +758,7 @@ def queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname):
             else: ls = '-.'
 
             for j, l in el_lines.iterrows():
-                plt.vlines(l['Observed'], y.min(), y.max(), 
-                           alpha=(float(l['Rel.'])/maxint)**.1, ls=ls, lw=2, color=colors[i])
+                ax1.axvline(l['Observed'], alpha=(float(l['Rel.'])/maxint)**.1, ls=ls, lw=2, color=colors[i])
 
         ## Save legend handles
         
@@ -774,14 +772,24 @@ def queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname):
             handles = np.append( handles, Line2D([0],[0],color=colors[i], lw=3, ls=ls, label=f'{ID_elements[i]}') )
 
 
-        ## Finish formatting plot
+        ## Finish plot
         
-        plt.plot( x, y, c='k' )
-        plt.fill_between( x, y-yerr, y+yerr, alpha=0.5, color='gray' )
-        plt.legend(handles, ID_elements)
-        plt.grid(True)
-        plt.xlabel(r'Wavelength ($\AA$)', fontsize=14)
-        plt.ylabel(r'Flux (erg/cm$^2$/s/$\AA$)', fontsize=14)
+        ax1.plot( x, y, c='k', zorder=10 )
+        ax1.fill_between( x, y-yerr, y+yerr, alpha=0.5, color='gray', zorder=10 )
+
+        # Plot full spectrum with line annotated
+        ax2.plot( wavelengths, flux, c='k' )
+        ax2.fill_between( wavelengths, flux + fluxerr, flux - fluxerr, alpha=0.5, color='gray' )
+        
+        ax2.set_ylim(0.1*flux.min(), 30*np.median(np.abs(flux)))
+        ax2.axvline(peak)
+        
+        ax1.set_xlabel(r'Wavelength ($\AA$)', fontsize=14)
+        ax2.set_xlabel(r'Wavelength ($\AA$)', fontsize=14)
+        ax1.set_ylabel(r'Flux (erg/cm$^2$/s/$\AA$)', fontsize=14)
+    
+        ax1.legend(handles, ID_elements)
+        ax1.grid(True)
 
         
         ## Save figure
@@ -844,13 +852,10 @@ if __name__ == "__main__":
     
     ## Multiprocessing
     args = [(table[i], analysispath, datapath) for i in range(len(table))]
-    
-    s = time.time()
-    
-    with Pool() as pool:
-        pool.starmap(process, args)
+        
+    with Pool() as pool:        
+        for _ in tqdm(pool.istarmap(process, args), total=len(args)):
+            pass
 
-    e = time.time()  
-
-    print(f'Reduction of {len(table)} spectra completed in {(e-s) / 60.} minutes.')
+    print(f'Reduction of {len(table)} spectra completed.')
     

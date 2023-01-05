@@ -1,2 +1,4 @@
-NIST peak,Measured peak,Stddev,Peak label,Spectrum,Confident?
-1215.9055,1215.8779652834673,1.8760303112877266,1216,?,0.0
+Approx peak,Measured peak,Stddev,Peak label,Spectrum,Confident?
+1215.9055,1215.9055,0.0,1216,?,0.0
+1400.2946,1400.2946,0.0,1400,?,0.0
+1666.8206,1666.8206,0.0,1667,?,0.0

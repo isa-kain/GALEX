@@ -12,6 +12,8 @@ import glob
 from urllib import request
 import shutil
 from tempfile import mkstemp
+from multiprocessing import Pool
+import istarmap
 
 import matplotlib as mpl
 from matplotlib.colors import ListedColormap, LinearSegmentedColormap
@@ -139,13 +141,41 @@ def replace_swpid(scriptpath, swpid, objname):
 
 
 
+def runNISTqueries(row, analysispath, datapath):
+    '''
+    Calls queryNIST on a given row in database table, used for multiprocessing of this step.
+    '''
+
+    ## Grab and reformat object name
+    swpid = row['obs_id']
+    starname = row['main_id']
+    objname = starname.replace(' ','')
+    subfolder = f'{swpid}_{objname}' # e.g. swp55292_HD2454
+
+    ## Read in saved spectrum
+    spectrum = pd.read_csv(f'{datapath}/{swpid}.csv')
+    wavelengths = spectrum['Wavelengths'].values
+    flux = spectrum['Flux'].values
+    fluxerr = spectrum['Fluxerr'].values
+
+    ## Read in linestable
+    linestable = pd.read_csv(f'{analysispath}/{swpid}_{objname}/linestable.csv')
+
+    ## Query NIST for atomic lines near each identified spectral line
+    if row['Peaks verified']:
+        queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname)
+
+    return 0
+
+
+
 if __name__ == "__main__":
     
     
     ## Read in table of IUE data
     table = Table.read(f'{analysispath}/dataset.ecsv')
 
-    ## Process each IUE spectrum
+    ## User approves spectral lines for each spectrum
     for i, swpid in enumerate(tqdm(table['obs_id'])):
         
         ## Grab and reformat object name
@@ -166,13 +196,13 @@ if __name__ == "__main__":
             table['Peaks verified'][i] = True
             table.write(f'{analysispath}/dataset.ecsv', overwrite=True)
 
-            ## Query NIST for atomic lines near each identified spectral line
-            queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname)
-            
-        else:
-            
-            ## Read in linestable since it's not being passed from user_peaks()
-            linestable = pd.read_csv(f'{analysispath}/{swpid}_{objname}/linestable.csv')
-            
-            ## Query NIST for atomic lines near each identified spectral line
-            queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname)
+
+    print(f'Peaks in {len(table)} spectra verified. Querying NIST for matching lines.')
+
+
+    ## Run results through queryNIST using multiprocessing
+    args = [(table[i], analysispath, datapath) for i in range(len(table))]
+
+    with Pool() as pool:        
+        for _ in tqdm(pool.istarmap(runNISTqueries, args), total=len(args)):
+            pass

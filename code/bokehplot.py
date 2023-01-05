@@ -153,9 +153,14 @@ p.varea(x=wavelengths, y1=flux-fluxerr, y2=flux+fluxerr, fill_color="gray", alph
 sliders = []
 
 for i in range(len(linestable)):
+    
+    if linestable.loc[i, 'Measured peak']==0:
+        val = linestable.loc[i, 'Approx peak']
+    else:
+        val = linestable.loc[i, 'Measured peak']
 
     slider = Slider(start=wavelengths[0], end=wavelengths[-1], 
-                    value=linestable.loc[i, 'Measured peak'], 
+                    value=val, 
                     step=0.01, title=str(linestable.loc[i, 'Peak label']), width=600, align='center')
     span = Span(location=slider.value, dimension='height', line_color="#B488D3", line_dash='dashed')
     p.add_layout(span)
