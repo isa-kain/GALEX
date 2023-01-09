@@ -20,6 +20,7 @@ import matplotlib as mpl
 from matplotlib.colors import ListedColormap, LinearSegmentedColormap
 from matplotlib.patches import Patch
 from matplotlib.lines import Line2D
+from matplotlib.ticker import AutoMinorLocator
 
 from astropy.io import fits
 import astropy.units as u
@@ -663,14 +664,18 @@ def queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname):
 #         else:
 #             margin = 3. * float(line['Stddev']) # AA
 
-        margin = 12.
+        plotmargin = 12.
         peak = float(line['Measured peak'])
  
         if peak==0:
-            peak = float(line['Approx peak'])
+            peak = float(line['Approx peak']) # peak hasn't been fit yet
 
-        ulim = peak - margin
-        hlim = peak + margin
+        ulim = peak - plotmargin
+        hlim = peak + plotmargin
+        
+        NISTmargin = 5.
+        NISTulim = peak - NISTmargin
+        NISThlim = peak + NISTmargin
         
 
         trim = (wavelengths >= ulim) & (wavelengths <= hlim)
@@ -690,7 +695,7 @@ def queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname):
         for i, el in enumerate(elements):
             
             try:
-                result = Nist.query(ulim * u.AA, hlim * u.AA, linename=f"{el}")
+                result = Nist.query(NISTulim * u.AA, NISThlim * u.AA, linename=f"{el}")
             except:
                 continue
 
@@ -717,6 +722,17 @@ def queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname):
         NISTresults['Rel.'] = NISTresults['Rel.'].str.replace('[,()\/*a-zA-Z?:]', '', regex=True).str.strip()
         NISTresults['Rel.'] = NISTresults['Rel.'].str.replace('', '0', regex=True).str.strip()
         NISTresults['Rel.'] = NISTresults['Rel.'].astype(float)
+        
+        
+        ## Drop rows if their relative intensities = 0
+        
+        NISTresults = NISTresults[NISTresults['Rel.']!=0.]
+        NISTresults.reset_index(drop=True, inplace=True)
+        
+        
+        ## Order by increasing wavelength
+        
+        NISTresults.sort_values('Observed', ignore_index=True, inplace=True)
         
         
         ## Save table
@@ -758,8 +774,11 @@ def queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname):
             else: ls = '-.'
 
             for j, l in el_lines.iterrows():
-                ax1.axvline(l['Observed'], alpha=(float(l['Rel.'])/maxint)**.1, ls=ls, lw=2, color=colors[i])
+                
+                opacity = np.exp(1 / np.sum(l['Spectrum'] == NISTresults['Spectrum'])) / np.exp(1)
+                ax1.axvline(l['Observed'], alpha=opacity, ls=ls, lw=2, color=colors[i])
 
+                
         ## Save legend handles
         
         handles = []
@@ -776,20 +795,23 @@ def queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname):
         
         ax1.plot( x, y, c='k', zorder=10 )
         ax1.fill_between( x, y-yerr, y+yerr, alpha=0.5, color='gray', zorder=10 )
+        
+        ax1.grid(True, which='both', ls=':')
+        ax1.xaxis.set_minor_locator(AutoMinorLocator())
 
         # Plot full spectrum with line annotated
         ax2.plot( wavelengths, flux, c='k' )
         ax2.fill_between( wavelengths, flux + fluxerr, flux - fluxerr, alpha=0.5, color='gray' )
+        ax2.axvline(peak, zorder=0)
         
-        ax2.set_ylim(0.1*flux.min(), 30*np.median(np.abs(flux)))
-        ax2.axvline(peak)
+        ax2.set_ylim(0.1*flux.min(), 50*np.median(np.abs(flux)))
+        ax2.set_xlim(1175, 2000)
         
-        ax1.set_xlabel(r'Wavelength ($\AA$)', fontsize=14)
-        ax2.set_xlabel(r'Wavelength ($\AA$)', fontsize=14)
-        ax1.set_ylabel(r'Flux (erg/cm$^2$/s/$\AA$)', fontsize=14)
-    
         ax1.legend(handles, ID_elements)
-        ax1.grid(True)
+        ax1.set_title(f'Line at {peak:0.5f} A')
+        ax1.set_xlabel(r'Wavelength ($\AA$)', fontsize=14)
+        ax1.set_ylabel(r'Flux (erg/cm$^2$/s/$\AA$)', fontsize=14)
+        ax2.set_xlabel(r'Wavelength ($\AA$)', fontsize=14)
 
         
         ## Save figure

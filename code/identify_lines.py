@@ -58,16 +58,15 @@ def line_popup(swpid, objname, starname, cen, linetable):
 
 
     ## Define layout of window
-    col1 = [[sg.Image(imgpath)],
-            [sg.Text('Spectrum:')],
+    col1 = [[sg.Text('Spectrum:')],
             [sg.Input(default_text = f"{linetable.loc[loc,'Spectrum']}", key='-SPECTRUM-')],
             [sg.Checkbox('Confident?', default=True, key='-CONFIDENT-')],
             [sg.Button('Ok'), sg.Button('Cancel')] ]
-    col2 = [sg.Table(tbl_list, headings = tbl_cols)]
-    layout = [[col1, col2]]
+    col2 = [[sg.Table(tbl_list, headings = tbl_cols, font='Helvetica 14')]]
+    layout = [[sg.Image(imgpath)], [col1, col2]]
 
     # Create the Window
-    window = sg.Window('Spectral line identification', layout)
+    window = sg.Window(f'Spectral line identification {swpid}', layout)
 
     while True:
         event, values = window.read()
@@ -148,7 +147,7 @@ def spectrum_popup(swpid, objname, starname, linetable):
 
 
     ## Make buttons
-    centers = linetable['Peak label'].values
+    centers = np.sort(linetable['Peak label'].values)
     labels = np.array([fr'{centers[i]} A' for i in range(len(centers))])
     buttons = []
     
@@ -166,7 +165,8 @@ def spectrum_popup(swpid, objname, starname, linetable):
 
     
     ## Make window -- python is breaking here
-    window = sg.Window(f'{starname} spectrum', layout, finalize=True, element_justification='center', font='Helvetica 18')
+    window = sg.Window(f'{starname} / {swpid} spectrum', layout, finalize=True, 
+                       element_justification='center', font='Helvetica 18')
     
     while True:
 

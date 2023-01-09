@@ -122,8 +122,8 @@ def BTcallback():
 ##################################
     
 
-swpid = 'swp54543'
-objname = 'HD155674'
+swpid = 'swp51800'
+objname = 'HD216446'
 
 
 ## Read in data
