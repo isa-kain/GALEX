@@ -39,7 +39,7 @@ from astroquery.xmatch import XMatch
 from astroquery.vizier import Vizier
 from astroquery.mast import Observations
 
-from pipeline import queryNIST ## my function!!!
+from pipeline import queryNIST, build_template_spectra ## my function!!!
 
 
 ## Where should analysis results and data be saved to?

@@ -720,7 +720,7 @@ def queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname):
         ## Reformat relative intensities column (strip keyword info)
         
         NISTresults['Rel.'] = NISTresults['Rel.'].str.replace('[,()\/*a-zA-Z?:]', '', regex=True).str.strip()
-        NISTresults['Rel.'] = NISTresults['Rel.'].str.replace('', '0', regex=True).str.strip()
+        NISTresults['Rel.'] = NISTresults['Rel.'].str.replace('^\s*$', '0', regex=True).str.strip()
         NISTresults['Rel.'] = NISTresults['Rel.'].astype(float)
         
         
@@ -826,6 +826,77 @@ def queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname):
     return 0
 
 
+
+def build_template_spectra(swpid, objname, analysispath, wav_min, wav_max):
+    '''
+    Compiles list of all candidate emission lines matched to any lines in IUE spectrum. 
+    Builds a "template spectrum" for each element and transition matched by the pipeline.
+    
+    Inputs:
+    
+    Returns:
+    nothing, but saves "template spectrum" to csv.
+    '''
+
+    ## Initialize DF to collect all emission line candidates matched with lines in IUE spectra
+    allspectra = pd.DataFrame()
+
+    ## Load table of all emission line candidates matched to each individual IUE spectral line
+    lineIDs = glob.glob(f'{analysispath}/{swpid}_{objname}/lineID_tables/*.csv')
+    peaklabels = [lineIDs[i].split('/')[-1].strip('.csv') for i in range(len(lineIDs))]
+
+
+    for pl in peaklabels:
+
+        linematches = pd.read_csv(f'{analysispath}/{swpid}_{objname}/lineID_tables/{pl}.csv')  
+        allspectra = pd.concat([allspectra, linematches], axis=0, ignore_index=True)
+
+        try: allspectra.drop(columns=['Unnamed: 0'], inplace=True)
+        except: pass
+        
+        
+    if len(allspectra)==0: ## no lines in spectrum, skip
+        return 0
+
+
+    for spec in allspectra['Spectrum'].unique():
+
+        ## Build DF of atomic lines from one element identified in this stellar spectrum by pipeline
+        speclines = allspectra[allspectra['Spectrum']==spec].reset_index(drop=True)
+        speclines['Pipeline matched'] = [True]*len(speclines)
+
+        ## Query NIST for all lines from current spectrum
+        ask = Nist.query(wav_min * u.AA, wav_max * u.AA, linename=f"{spec}") 
+
+        result = pd.DataFrame( data={'Spectrum':[spec]*len(ask), 
+                                     'Observed':ask['Observed'].data, 
+                                     'Rel.':ask['Rel.'].data.astype(str), 
+                                     'Acc.':ask['Acc.'].data} )
+
+        result.dropna(axis=0, subset=['Observed', 'Rel.'], inplace=True)
+
+        ## Reformat relative intensities column (strip keyword info)
+        result['Rel.'] = result['Rel.'].str.replace('[,()\/*a-zA-Z?:]', '', regex=True).str.strip()
+        result['Rel.'] = result['Rel.'].str.replace('^\s*$', '0', regex=True).str.strip()
+        result['Rel.'] = result['Rel.'].astype(float)
+        result['Pipeline matched'] = [False]*len(result)
+
+        ## Drop lines in result that are weaker than weakest line found by pipeline ##FIXME hey this kind of sucks because it's RELATIVE intensity and NIST's documentation on what that means is uninformative
+        result[ result['Rel.'] >= np.min(speclines['Rel.']) ].reset_index(drop=True)
+
+        ## Combine speclines (lines found by pipeline attributed to single element) with result (all lines from the element with relative intensity greater than weakest line found by pipeline)
+        fullspectrumlines = pd.concat([speclines, result], axis=0, ignore_index=True)
+
+        ## Drop duplicate rows, where line is recognized by pipeline AND returned by NIST query
+        fullspectrumlines = fullspectrumlines.drop_duplicates(subset=['Spectrum', 'Observed', 'Rel.', 'Acc.'], ignore_index=True)
+
+        ## Save template spectrum
+        fullspectrumlines.to_csv(f'{analysispath}/{swpid}_{objname}/lineID_tables/{spec}_template.csv', index=False)
+        
+        return 0
+
+    
+
 def process(row, analysispath, datapath):
     '''Actually run pipeline.'''
     
@@ -859,6 +930,10 @@ def process(row, analysispath, datapath):
 
     ## Query NIST for atomic lines near each identified spectral line
     queryNIST(linestable, wavelengths, flux, fluxerr, swpid, objname)
+    
+    
+#     ## For each matching element from queryNIST, build template spectrum
+#     build_template_spectra(swpid, objname, analysispath, wavelengths[0], wavelengths[-1])
     
     
     return 0
